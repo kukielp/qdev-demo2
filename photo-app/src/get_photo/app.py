@@ -1,7 +1,12 @@
 import json
 import os
 import boto3
+import logging
 from botocore.exceptions import ClientError
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # Initialize AWS clients
 s3_client = boto3.client('s3')
@@ -10,104 +15,100 @@ dynamodb = boto3.resource('dynamodb')
 # Get environment variables
 BUCKET_NAME = os.environ.get('PHOTOS_BUCKET')
 TABLE_NAME = os.environ.get('PHOTOS_TABLE')
-URL_EXPIRATION = int(os.environ.get('URL_EXPIRATION', '3600'))  # Default 1 hour
+URL_EXPIRATION = int(os.environ.get('URL_EXPIRATION', 3600))  # Default to 1 hour
 
 def lambda_handler(event, context):
     """
-    Lambda function to retrieve photo information and generate a pre-signed URL.
+    Lambda function to retrieve photo download URLs.
     
     This function:
-    1. Extracts the photo ID from the path parameters
-    2. Retrieves the photo metadata from DynamoDB
+    1. Receives a photo ID from the API Gateway path parameter
+    2. Looks up the photo metadata in DynamoDB
     3. Generates a pre-signed URL for downloading the photo from S3
-    4. Returns the photo metadata and pre-signed URL
     
     Args:
-        event: API Gateway event containing the photo ID
-        context: Lambda context
+        event (dict): API Gateway event
+        context (object): Lambda context
         
     Returns:
-        API Gateway response with status code and photo information including pre-signed URL
+        dict: API Gateway response with pre-signed URL
     """
     try:
-        # Extract photo ID from path parameters
-        photo_id = event.get('pathParameters', {}).get('photoId')
+        logger.info("Processing get photo request")
         
-        # Validate input
-        if not photo_id:
+        # Extract photo ID from path parameters
+        if 'pathParameters' not in event or not event['pathParameters'] or 'photoId' not in event['pathParameters']:
             return {
                 'statusCode': 400,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps({'error': 'Missing required parameter: photoId'})
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': 'Missing photoId parameter'})
             }
+            
+        photo_id = event['pathParameters']['photoId']
+        logger.info(f"Retrieving photo with ID: {photo_id}")
         
-        # Get photo metadata from DynamoDB
-        table = dynamodb.Table(TABLE_NAME)
-        response = table.get_item(
-            Key={
-                'photoId': photo_id
-            }
-        )
-        
-        # Check if photo exists
-        if 'Item' not in response:
+        # Look up photo metadata in DynamoDB
+        try:
+            table = dynamodb.Table(TABLE_NAME)
+            response = table.get_item(Key={'photoId': photo_id})
+            
+            if 'Item' not in response:
+                logger.warning(f"Photo with ID {photo_id} not found")
+                return {
+                    'statusCode': 404,
+                    'headers': {'Content-Type': 'application/json'},
+                    'body': json.dumps({'error': 'Photo not found'})
+                }
+                
+            photo_metadata = response['Item']
+            s3_key = photo_metadata['s3Key']
+            file_name = photo_metadata['fileName']
+            
+        except ClientError as e:
+            logger.error(f"Error retrieving metadata from DynamoDB: {str(e)}")
             return {
-                'statusCode': 404,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps({'error': f'Photo with ID {photo_id} not found'})
+                'statusCode': 500,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': 'Failed to retrieve photo metadata'})
             }
         
-        # Get photo metadata
-        photo_metadata = response['Item']
-        s3_key = photo_metadata['s3Key']
-        
-        # Generate pre-signed URL
+        # Generate pre-signed URL for S3 object
         try:
             presigned_url = s3_client.generate_presigned_url(
                 'get_object',
                 Params={
                     'Bucket': BUCKET_NAME,
-                    'Key': s3_key
+                    'Key': s3_key,
+                    'ResponseContentDisposition': f'attachment; filename="{file_name}"'
                 },
                 ExpiresIn=URL_EXPIRATION
             )
+            logger.info(f"Generated pre-signed URL for photo ID: {photo_id}")
+            
         except ClientError as e:
-            print(f"Error generating presigned URL: {str(e)}")
+            logger.error(f"Error generating pre-signed URL: {str(e)}")
             return {
                 'statusCode': 500,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
+                'headers': {'Content-Type': 'application/json'},
                 'body': json.dumps({'error': 'Failed to generate download URL'})
             }
         
-        # Add presigned URL to response
-        photo_metadata['downloadUrl'] = presigned_url
-        
-        # Return success response
+        # Return success response with pre-signed URL and metadata
         return {
             'statusCode': 200,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps(photo_metadata)
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'photoId': photo_id,
+                'fileName': file_name,
+                'uploadTimestamp': photo_metadata.get('uploadTimestamp'),
+                'downloadUrl': presigned_url
+            })
         }
         
     except Exception as e:
-        print(f"Error: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
         return {
             'statusCode': 500,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({'error': str(e)})
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({'error': 'Internal server error'})
         }

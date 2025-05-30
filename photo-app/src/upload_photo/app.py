@@ -4,6 +4,11 @@ import uuid
 import base64
 import boto3
 from datetime import datetime
+import logging
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # Initialize AWS clients
 s3_client = boto3.client('s3')
@@ -18,113 +23,118 @@ def lambda_handler(event, context):
     Lambda function to handle photo uploads.
     
     This function:
-    1. Receives a base64 encoded image and metadata from API Gateway
-    2. Decodes the image
-    3. Generates a unique ID for the photo
-    4. Uploads the photo to S3
-    5. Stores metadata in DynamoDB
-    6. Returns the photo ID and other relevant information
+    1. Receives photo data and metadata from API Gateway
+    2. Uploads the photo to S3
+    3. Stores metadata in DynamoDB
     
     Args:
-        event: API Gateway event containing the photo data and metadata
-        context: Lambda context
+        event (dict): API Gateway event
+        context (object): Lambda context
         
     Returns:
-        API Gateway response with status code and photo information
+        dict: API Gateway response
     """
     try:
+        logger.info("Processing upload request")
+        
         # Parse request body
-        body = json.loads(event.get('body', '{}'))
-        
-        # Extract file data and metadata
-        file_content = body.get('fileContent')
-        file_name = body.get('fileName')
-        
-        # Validate input
-        if not file_content or not file_name:
+        if 'body' not in event:
             return {
                 'statusCode': 400,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps({'error': 'Missing required fields: fileContent or fileName'})
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': 'Missing request body'})
             }
+            
+        # Check if body is base64 encoded
+        if event.get('isBase64Encoded', False):
+            body = json.loads(base64.b64decode(event['body']))
+        else:
+            body = json.loads(event['body'])
+        
+        # Validate required fields
+        if 'fileName' not in body or 'fileContent' not in body:
+            return {
+                'statusCode': 400,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': 'Missing required fields: fileName and fileContent'})
+            }
+        
+        file_name = body['fileName']
+        file_content = body['fileContent']
         
         # Decode base64 file content
-        file_content_decoded = base64.b64decode(file_content)
+        try:
+            file_bytes = base64.b64decode(file_content)
+        except Exception as e:
+            logger.error(f"Error decoding file content: {str(e)}")
+            return {
+                'statusCode': 400,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': 'Invalid file content encoding'})
+            }
         
-        # Generate unique photo ID
+        # Generate unique photo ID and S3 key
         photo_id = str(uuid.uuid4())
+        s3_key = f"photos/{photo_id}/{file_name}"
+        timestamp = datetime.utcnow().isoformat()
         
-        # Generate S3 key
-        s3_key = f"{photo_id}/{file_name}"
-        
-        # Upload to S3
-        s3_client.put_object(
-            Bucket=BUCKET_NAME,
-            Key=s3_key,
-            Body=file_content_decoded,
-            ContentType=get_content_type(file_name)
-        )
-        
-        # Get current timestamp
-        timestamp = datetime.now().isoformat()
+        # Upload file to S3
+        try:
+            s3_client.put_object(
+                Bucket=BUCKET_NAME,
+                Key=s3_key,
+                Body=file_bytes,
+                ContentType=body.get('contentType', 'image/jpeg')  # Default to JPEG if not specified
+            )
+            logger.info(f"File uploaded to S3: {s3_key}")
+        except Exception as e:
+            logger.error(f"Error uploading to S3: {str(e)}")
+            return {
+                'statusCode': 500,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': 'Failed to upload file to S3'})
+            }
         
         # Store metadata in DynamoDB
-        table = dynamodb.Table(TABLE_NAME)
-        table.put_item(
-            Item={
-                'photoId': photo_id,
-                'fileName': file_name,
-                'uploadTimestamp': timestamp,
-                's3Key': s3_key
+        try:
+            table = dynamodb.Table(TABLE_NAME)
+            table.put_item(
+                Item={
+                    'photoId': photo_id,
+                    'fileName': file_name,
+                    'uploadTimestamp': timestamp,
+                    's3Key': s3_key
+                }
+            )
+            logger.info(f"Metadata stored in DynamoDB for photo ID: {photo_id}")
+        except Exception as e:
+            logger.error(f"Error storing metadata in DynamoDB: {str(e)}")
+            # If DynamoDB fails, try to delete the S3 object to maintain consistency
+            try:
+                s3_client.delete_object(Bucket=BUCKET_NAME, Key=s3_key)
+            except Exception as delete_error:
+                logger.error(f"Error deleting S3 object after DynamoDB failure: {str(delete_error)}")
+            
+            return {
+                'statusCode': 500,
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': 'Failed to store metadata'})
             }
-        )
         
-        # Return success response
+        # Return success response with photo ID
         return {
             'statusCode': 201,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
+            'headers': {'Content-Type': 'application/json'},
             'body': json.dumps({
                 'photoId': photo_id,
-                'fileName': file_name,
-                'uploadTimestamp': timestamp,
-                's3Key': s3_key
+                'message': 'Photo uploaded successfully'
             })
         }
         
     except Exception as e:
-        print(f"Error: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
         return {
             'statusCode': 500,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({'error': str(e)})
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({'error': 'Internal server error'})
         }
-
-def get_content_type(file_name):
-    """
-    Determine the content type based on file extension
-    
-    Args:
-        file_name: Name of the file
-        
-    Returns:
-        Content type string
-    """
-    extension = file_name.lower().split('.')[-1]
-    content_types = {
-        'jpg': 'image/jpeg',
-        'jpeg': 'image/jpeg',
-        'png': 'image/png',
-        'gif': 'image/gif',
-        'bmp': 'image/bmp',
-        'webp': 'image/webp'
-    }
-    return content_types.get(extension, 'application/octet-stream')

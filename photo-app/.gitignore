@@ -19,6 +19,14 @@ var/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.pytest_cache/
+cover/
 
 # Virtual Environment
 venv/
@@ -28,12 +36,14 @@ env/
 # AWS SAM
 .aws-sam/
 samconfig.toml
+packaged.yaml
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
+*~
 
 # OS specific
 .DS_Store
@@ -45,15 +55,6 @@ Thumbs.db
 .env.development.local
 .env.test.local
 .env.production.local
-
-# Testing
-.coverage
-htmlcov/
-.pytest_cache/
-.tox/
-nosetests.xml
-coverage.xml
-*.cover
 
 # Logs
 logs/

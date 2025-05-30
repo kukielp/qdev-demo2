@@ -14,158 +14,187 @@ import app
 class TestGetPhotoFunction(unittest.TestCase):
     """Test cases for the get_photo Lambda function"""
 
-    @patch('app.boto3.client')
-    @patch('app.boto3.resource')
-    def test_successful_retrieval(self, mock_resource, mock_client):
+    def setUp(self):
+        """Set up test fixtures before each test"""
+        # Mock environment variables
+        self.env_patcher = patch.dict(os.environ, {
+            'PHOTOS_BUCKET': 'test-photos-bucket',
+            'PHOTOS_TABLE': 'test-photos-table',
+            'URL_EXPIRATION': '3600'
+        })
+        self.env_patcher.start()
+        
+        # Sample test data
+        self.test_photo_id = 'test-photo-id-1234'
+        self.test_file_name = 'test-image.jpg'
+        self.test_s3_key = f'photos/{self.test_photo_id}/{self.test_file_name}'
+        self.test_timestamp = '2023-01-01T12:00:00'
+        self.test_presigned_url = 'https://test-bucket.s3.amazonaws.com/test-key?signature=abc123'
+
+    def tearDown(self):
+        """Tear down test fixtures after each test"""
+        self.env_patcher.stop()
+
+    @patch('app.s3_client')
+    @patch('app.dynamodb.Table')
+    def test_successful_get_photo(self, mock_table, mock_s3_client):
         """Test successful photo retrieval"""
-        # Mock S3 client
-        mock_s3 = MagicMock()
-        mock_s3.generate_presigned_url.return_value = "https://test-presigned-url.com"
-        mock_client.return_value = mock_s3
-        
-        # Mock DynamoDB table and response
-        mock_table = MagicMock()
-        mock_table.get_item.return_value = {
+        # Mock DynamoDB response
+        mock_table_instance = MagicMock()
+        mock_table.return_value = mock_table_instance
+        mock_table_instance.get_item.return_value = {
             'Item': {
-                'photoId': 'test-photo-id',
-                'fileName': 'test_image.jpg',
-                'uploadTimestamp': '2023-01-01T12:00:00',
-                's3Key': 'test-photo-id/test_image.jpg'
+                'photoId': self.test_photo_id,
+                'fileName': self.test_file_name,
+                'uploadTimestamp': self.test_timestamp,
+                's3Key': self.test_s3_key
             }
         }
-        mock_dynamodb = MagicMock()
-        mock_dynamodb.Table.return_value = mock_table
-        mock_resource.return_value = mock_dynamodb
+        
+        # Mock S3 presigned URL generation
+        mock_s3_client.generate_presigned_url.return_value = self.test_presigned_url
         
         # Create test event
         event = {
             'pathParameters': {
-                'photoId': 'test-photo-id'
+                'photoId': self.test_photo_id
             }
         }
-        
-        # Set environment variables
-        os.environ['PHOTOS_BUCKET'] = 'test-bucket'
-        os.environ['PHOTOS_TABLE'] = 'test-table'
-        os.environ['URL_EXPIRATION'] = '3600'
         
         # Call the Lambda function
         response = app.lambda_handler(event, {})
         
-        # Verify response
+        # Verify the response
         self.assertEqual(response['statusCode'], 200)
-        
-        # Parse response body
         response_body = json.loads(response['body'])
+        self.assertEqual(response_body['photoId'], self.test_photo_id)
+        self.assertEqual(response_body['fileName'], self.test_file_name)
+        self.assertEqual(response_body['uploadTimestamp'], self.test_timestamp)
+        self.assertEqual(response_body['downloadUrl'], self.test_presigned_url)
         
-        # Verify response data
-        self.assertEqual(response_body['photoId'], 'test-photo-id')
-        self.assertEqual(response_body['fileName'], 'test_image.jpg')
-        self.assertEqual(response_body['s3Key'], 'test-photo-id/test_image.jpg')
-        self.assertEqual(response_body['downloadUrl'], 'https://test-presigned-url.com')
+        # Verify DynamoDB was called correctly
+        mock_table_instance.get_item.assert_called_once_with(Key={'photoId': self.test_photo_id})
         
-        # Verify S3 generate_presigned_url was called
-        mock_s3.generate_presigned_url.assert_called_once_with(
-            'get_object',
-            Params={
-                'Bucket': 'test-bucket',
-                'Key': 'test-photo-id/test_image.jpg'
-            },
-            ExpiresIn=3600
-        )
-        
-        # Verify DynamoDB get_item was called
-        mock_table.get_item.assert_called_once_with(
-            Key={
-                'photoId': 'test-photo-id'
-            }
-        )
-    
-    def test_missing_photo_id(self):
+        # Verify S3 was called correctly
+        mock_s3_client.generate_presigned_url.assert_called_once()
+        s3_args = mock_s3_client.generate_presigned_url.call_args
+        self.assertEqual(s3_args[0][0], 'get_object')
+        self.assertEqual(s3_args[1]['Params']['Bucket'], 'test-photos-bucket')
+        self.assertEqual(s3_args[1]['Params']['Key'], self.test_s3_key)
+        self.assertEqual(s3_args[1]['ExpiresIn'], 3600)
+
+    @patch('app.dynamodb.Table')
+    def test_missing_photo_id(self, mock_table):
         """Test handling of missing photo ID"""
-        # Test with missing photoId
-        event_missing_id = {
-            'pathParameters': {}
-        }
-        
-        response = app.lambda_handler(event_missing_id, {})
-        self.assertEqual(response['statusCode'], 400)
-        
-        # Test with no pathParameters
-        event_no_params = {}
-        
-        response = app.lambda_handler(event_no_params, {})
-        self.assertEqual(response['statusCode'], 400)
-    
-    @patch('app.boto3.client')
-    @patch('app.boto3.resource')
-    def test_photo_not_found(self, mock_resource, mock_client):
-        """Test handling of non-existent photo"""
-        # Mock DynamoDB table and response for non-existent item
-        mock_table = MagicMock()
-        mock_table.get_item.return_value = {}  # No Item in response
-        mock_dynamodb = MagicMock()
-        mock_dynamodb.Table.return_value = mock_table
-        mock_resource.return_value = mock_dynamodb
-        
-        # Create test event
+        # Create test event with missing photoId
         event = {
-            'pathParameters': {
-                'photoId': 'non-existent-id'
-            }
+            'pathParameters': None
         }
-        
-        # Set environment variables
-        os.environ['PHOTOS_TABLE'] = 'test-table'
         
         # Call the Lambda function
         response = app.lambda_handler(event, {})
         
-        # Verify response
+        # Verify the response
+        self.assertEqual(response['statusCode'], 400)
+        response_body = json.loads(response['body'])
+        self.assertIn('error', response_body)
+        
+        # Verify DynamoDB was not called
+        mock_table.return_value.get_item.assert_not_called()
+
+    @patch('app.s3_client')
+    @patch('app.dynamodb.Table')
+    def test_photo_not_found(self, mock_table, mock_s3_client):
+        """Test handling of photo not found in DynamoDB"""
+        # Mock DynamoDB response for item not found
+        mock_table_instance = MagicMock()
+        mock_table.return_value = mock_table_instance
+        mock_table_instance.get_item.return_value = {}  # No Item in response
+        
+        # Create test event
+        event = {
+            'pathParameters': {
+                'photoId': self.test_photo_id
+            }
+        }
+        
+        # Call the Lambda function
+        response = app.lambda_handler(event, {})
+        
+        # Verify the response
         self.assertEqual(response['statusCode'], 404)
-    
-    @patch('app.boto3.client')
-    @patch('app.boto3.resource')
-    def test_presigned_url_error(self, mock_resource, mock_client):
-        """Test handling of errors when generating presigned URL"""
-        # Mock S3 client to raise an exception
-        mock_s3 = MagicMock()
-        mock_s3.generate_presigned_url.side_effect = ClientError(
-            {'Error': {'Code': 'TestException', 'Message': 'Test error message'}},
-            'generate_presigned_url'
-        )
-        mock_client.return_value = mock_s3
+        response_body = json.loads(response['body'])
+        self.assertIn('error', response_body)
         
-        # Mock DynamoDB table and response
-        mock_table = MagicMock()
-        mock_table.get_item.return_value = {
-            'Item': {
-                'photoId': 'test-photo-id',
-                'fileName': 'test_image.jpg',
-                'uploadTimestamp': '2023-01-01T12:00:00',
-                's3Key': 'test-photo-id/test_image.jpg'
-            }
-        }
-        mock_dynamodb = MagicMock()
-        mock_dynamodb.Table.return_value = mock_table
-        mock_resource.return_value = mock_dynamodb
+        # Verify S3 was not called
+        mock_s3_client.generate_presigned_url.assert_not_called()
+
+    @patch('app.s3_client')
+    @patch('app.dynamodb.Table')
+    def test_dynamodb_error(self, mock_table, mock_s3_client):
+        """Test handling of DynamoDB error"""
+        # Mock DynamoDB to raise an exception
+        mock_table_instance = MagicMock()
+        mock_table.return_value = mock_table_instance
+        mock_table_instance.get_item.side_effect = ClientError(
+            {'Error': {'Code': 'InternalServerError', 'Message': 'DynamoDB error'}},
+            'GetItem'
+        )
         
         # Create test event
         event = {
             'pathParameters': {
-                'photoId': 'test-photo-id'
+                'photoId': self.test_photo_id
             }
         }
-        
-        # Set environment variables
-        os.environ['PHOTOS_BUCKET'] = 'test-bucket'
-        os.environ['PHOTOS_TABLE'] = 'test-table'
         
         # Call the Lambda function
         response = app.lambda_handler(event, {})
         
-        # Verify response
+        # Verify the response
         self.assertEqual(response['statusCode'], 500)
+        response_body = json.loads(response['body'])
+        self.assertIn('error', response_body)
+        
+        # Verify S3 was not called
+        mock_s3_client.generate_presigned_url.assert_not_called()
+
+    @patch('app.s3_client')
+    @patch('app.dynamodb.Table')
+    def test_s3_presigned_url_error(self, mock_table, mock_s3_client):
+        """Test handling of S3 presigned URL generation error"""
+        # Mock DynamoDB response
+        mock_table_instance = MagicMock()
+        mock_table.return_value = mock_table_instance
+        mock_table_instance.get_item.return_value = {
+            'Item': {
+                'photoId': self.test_photo_id,
+                'fileName': self.test_file_name,
+                'uploadTimestamp': self.test_timestamp,
+                's3Key': self.test_s3_key
+            }
+        }
+        
+        # Mock S3 to raise an exception
+        mock_s3_client.generate_presigned_url.side_effect = ClientError(
+            {'Error': {'Code': 'InternalServerError', 'Message': 'S3 error'}},
+            'GeneratePresignedUrl'
+        )
+        
+        # Create test event
+        event = {
+            'pathParameters': {
+                'photoId': self.test_photo_id
+            }
+        }
+        
+        # Call the Lambda function
+        response = app.lambda_handler(event, {})
+        
+        # Verify the response
+        self.assertEqual(response['statusCode'], 500)
+        response_body = json.loads(response['body'])
+        self.assertIn('error', response_body)
 
 if __name__ == '__main__':
     unittest.main()
